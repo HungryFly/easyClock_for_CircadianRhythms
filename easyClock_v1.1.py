@@ -10,12 +10,12 @@ from scipy.stats import kendalltau
 from scipy.optimize import curve_fit
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import (
-    QMessageBox, QInputDialog, QDialog, QVBoxLayout, QHBoxLayout,QComboBox,
+    QMessageBox, QInputDialog, QDialog, QVBoxLayout, QHBoxLayout,QComboBox,QFileDialog,
     QLabel, QPushButton, QTextEdit, QScrollArea, QWidget, QSizePolicy, QColorDialog
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-
+import matplotlib.pyplot as plt
 
 
 def get_resource_path(filename):
@@ -28,10 +28,10 @@ def acrophase_to_hours(rad_phase, period=24):
     return hours % period
 
 # ------------------------
-# Python-based JTK_CYCLE function
+# Cosinor-Kendall function
 # ------------------------
 
-def run_python_jtk(series, period_range=range(20, 28), interval=1):
+def run_Cosinor_Kendall(series, period_range=range(20, 28), interval=1):
     y = series.rank().values
     n = len(y)
     best_p = 1.0
@@ -61,7 +61,7 @@ def run_python_jtk(series, period_range=range(20, 28), interval=1):
         'PER': round(best_per, 2),
         'LAG': round(best_lag, 2),
         'AMP': round(amp, 4),
-        'Method': 'Python-JTK'
+        'Method': 'Cosinor-Kendall'
     }
 
 # ------------------------
@@ -251,7 +251,6 @@ class CircadianApp(QtWidgets.QMainWindow):
         menu = self.menuBar()
         file_menu = menu.addMenu("File")
         file_menu.addAction("Load Data", self.load_data)
-        file_menu.addAction("Run Analysis", self.run_analysis)
 
         edit_menu = menu.addMenu("Edit")
         edit_menu.addAction("Axis Labels", self.set_axis_labels)
@@ -262,9 +261,17 @@ class CircadianApp(QtWidgets.QMainWindow):
         edit_menu.addAction("Legend Format", self.set_legend_style)
         edit_menu.addAction("Legend Labels", self.rename_legend_labels)
         
-        edit_menu = menu.addMenu("Read Me")
-        edit_menu.addAction("Acknowlegements", self.show_Acknowlegements)
-        edit_menu.addAction("Note", self.show_Notes)
+        analysis_menu=menu.addMenu("Analysis")
+        analysis_menu.addAction("Cosinor_Kendall and Cosinor",self.run_analysis)
+        
+        visualize_menu=menu.addMenu("Visualize")
+        actogram_action = QtWidgets.QAction("Plot Actogram", self)
+        actogram_action.triggered.connect(self.plot_actogram)
+        visualize_menu.addAction(actogram_action)
+        
+        about_menu = menu.addMenu("Read Me")
+        about_menu.addAction("Acknowlegements", self.show_Acknowlegements)
+        about_menu.addAction("Note", self.show_Notes)
 
 
     def _add_button(self, label, callback):
@@ -512,6 +519,64 @@ class CircadianApp(QtWidgets.QMainWindow):
         self.canvas.draw()
         self.canvas.flush_events()  # force full redraw
 
+    def plot_actogram(self):
+        try:
+            dtype, ok1 = QInputDialog.getItem(self, "Choose Dataset", "Behavior type:", list(self.group_means.keys()), 0, False)
+            if not ok1:
+                return
+            
+            if not self.group_means[dtype]:
+                QMessageBox.warning(self, "Error", f"No {dtype} data loaded.")
+                return
+            group, ok2 = QInputDialog.getItem(self, "Choose Group", "Select group:", list(self.group_means[dtype].keys()), 0, False)
+            if not ok2:
+                return
+            series = self.group_means[dtype][group]
+            values = series.values
+            times = series.index.to_numpy()
+            
+
+                # Determine time resolution and reshape
+            dt = times[1] - times[0]
+            points_per_day = int(round(24 / dt))
+            total_points = len(values)
+            n_days = total_points // points_per_day
+            fig, ax = plt.subplots(figsize=(10, 6))
+                
+            for day in range(n_days):
+                start = day * points_per_day
+                mid= start + points_per_day
+                end = mid + points_per_day
+                
+                left = values[start:mid]  # left side plot ends with on a repeated last day.
+                
+                y_offset = day * (np.max(values) * 1.2)
+                ax.bar(np.arange(0, 24, dt), left, width=dt*0.8, bottom=y_offset, color='black')
+                
+                if end > total_points:
+                    break
+                right = values[mid:end] # right side plot ends with on the last day.
+                ax.bar(np.arange(24, 48, dt), right, width=dt*0.8, bottom=y_offset, color='black')
+                    
+            ax.set_xlabel("Time (hr)")
+            ax.set_ylabel("Day")
+            ax.set_yticks([i * np.max(values) * 1.2 for i in range(n_days)])
+            ax.set_yticklabels([f"{i+1}" for i in range(n_days)])
+            ax.invert_yaxis()
+            ax.set_xlim(0, 48)
+            ax.set_xticks(np.arange(0, 49, 6))
+            plt.tight_layout()
+
+            # Ask for PDF export
+            pdf_path, _ = QFileDialog.getSaveFileName(self, "Save PDF", f"{group}_{dtype}_actogram.pdf", "PDF Files (*.pdf)")
+            if pdf_path:
+                fig.savefig(pdf_path)
+                QMessageBox.information(self, "Saved", f"Actogram saved to:\n{pdf_path}")
+            plt.close(fig)
+        except Exception as e:
+            QMessageBox.critical(self, "Actogram Error", str(e))
+                
+                
 
     def run_analysis(self):
         try:
@@ -559,8 +624,8 @@ class CircadianApp(QtWidgets.QMainWindow):
                     QMessageBox.warning(self, "Too Short", f"{group} has less than 48h of data.")
                     continue
                 
-                # --- Python JTK ---
-                jtk_res = run_python_jtk(sliced, interval=interval)
+                # --- Cosinor-Kendall ---
+                jtk_res = run_Cosinor_Kendall(sliced, interval=interval)
 
                 # --- Cosinor ---
                 cos_df = pd.DataFrame({
@@ -581,7 +646,7 @@ class CircadianApp(QtWidgets.QMainWindow):
                     # Append both results
                     self.result_table.append({
                         'Group': group,
-                        'Method': 'Python-JTK',
+                        'Method': 'Cosinor-Kendall',
                         **jtk_res
                     })
                     self.result_table.append({
