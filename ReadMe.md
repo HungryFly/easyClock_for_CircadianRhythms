@@ -1,5 +1,5 @@
 easyClock is a macOS-based desktop application for circadian rhythm analysis and visualization.
-To download the installment package or check version update, please follow this link: https://github.com/Dr-WUBINBIN/easyClock/releases
+To download the installation package or check version updates, please follow this link: https://github.com/Dr-WUBINBIN/easyClock/releases
 
 1.	Like standard macOS apps, the easyClock package is easy to install;
 2.	This app does not require any coding experience; it has a user-friendly interface;
