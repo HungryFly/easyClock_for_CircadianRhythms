@@ -1,6 +1,7 @@
-# fix Cosinor-Kendall Lag (acrophase) via corrected_lag;
-# fix Python-JTK Lag (acrophase) via (1-asymetry);
-# change amplitude calculation methods in Cosinor-Kendall and Python-JTK.
+# optimize plot actogram by adding shaded span functionality;
+# fix corrected_Lag in Cosinor_Kendall;
+# Change descriptions in Python-JTK parameter setting.
+
 
 import os
 import sys
@@ -21,6 +22,7 @@ from PyQt5.QtWidgets import (
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
 import matplotlib.pyplot as plt
 plt.rcParams["font.family"] = "Arial"
 
@@ -127,13 +129,13 @@ def run_discrete_jtk(series, period_range=range(22, 27), lag_range=None, asymmet
     bonf_p = min(1.0, best_p * len(test_results))
     amp = (np.percentile(series.values, 90) - np.percentile(series.values, 10)) / 2
 
+
     return {
         'ADJ.P': round(bonf_p, 6),
         'PER': round(best_per, 2),
         'LAG': round(best_lag, 2),
         'ASYM': round(best_asym, 2),
         'AMP': round(amp, 4),
-        'TAU': round(best_tau, 4),
         'Method': 'Python-JTK'
     }
 
@@ -168,14 +170,15 @@ def run_Cosine_Kendall(series, period_range=[20,20.5,21,21.5,22,22.5,23,23.5,24,
 
     bonf_p = min(1.0, best_p * len(test_results))
     amp = (np.percentile(series.values, 90) - np.percentile(series.values, 10)) / 2
-        #### using corrected_lag
-    corrected_lag = (best_lag - period / 2) % best_per
+        #### using corrected lag when tau < 0 because of Kendall's tau method.
+    corrected_lag = (best_lag - best_per / 2) % best_per if best_tau < 0 else best_lag
 
+    
     return {
         'ADJ.P': round(bonf_p, 6),
         'PER': round(best_per, 2),
-        'LAG': round(corrected_lag, 2),
         'AMP': round(amp, 4),
+        'LAG': round(corrected_lag, 2),
         'Method': 'Cosine-Kendall'
     }
 
@@ -283,7 +286,8 @@ def fit_group_harmonic_cosinor(df, period_range=[20,20.5,21,21.5,22,22.5,23,23.5
                 best_lag = lag
 
     bonf_p = min(1.0, best_p * len(test_results))  # Bonferroni correction
-    amp = (np.percentile(y, 75) - np.percentile(y, 25)) / 2
+    amp = (np.percentile(y, 90) - np.percentile(y, 10)) / 2
+
     acrophase_h = acrophase_to_hours(-2 * np.pi * best_lag / best_per, best_per)
 
     return pd.DataFrame([{
@@ -373,7 +377,7 @@ class JTKParamDialog(QDialog):
         layout.addWidget(self.period_input)
         layout.addWidget(QLabel("<<estimate Lags (acrophase, or peak time) (comma-separated)>>\n note: more lags you select, the slower efficiency you get!"))
         layout.addWidget(self.lag_input)
-        layout.addWidget(QLabel("<<Asymmetries (comma-separated, 0-1)>>\n 0.5 = symmetric shape\n < 0.5 = asym (left peak)\n > 0.5 = asym (right peak)"))
+        layout.addWidget(QLabel("<<Asymmetries (range: 0-1)>>\n 0.5 = symmetric shape\n < 0.5 = asymmetric (left half cycle is dominant)\n > 0.5 = asymmetric (right half cycle is dominant)\nExample: 0.3,0.4"))
         layout.addWidget(self.asym_input)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -465,7 +469,7 @@ class CircadianApp(QtWidgets.QMainWindow):
         edit_menu.addAction("Legend Labels", self.rename_legend_labels)
         
         analysis_menu=menu.addMenu("Analysis")
-        analysis_menu.addAction("Cosine_Kendall and Cosinor",self.run_analysis)
+        analysis_menu.addAction("Cosine-Kendall and Cosinor",self.run_analysis)
         analysis_menu.addAction("Python-JTK (non-parametric test)",self.run_pythonJTK_analysis)
         analysis_menu.addAction("Harmonic Cosinor (bimodal test)",self.run_fit_group_harmonic_cosinor)
         
@@ -479,7 +483,6 @@ class CircadianApp(QtWidgets.QMainWindow):
         about_menu.addAction("Note", self.show_Notes)
         about_menu.addAction("Acknowledgements and Feedback", self.show_Feedback)
 
-
     def _add_button(self, label, callback):
         btn = QPushButton(label)
         btn.clicked.connect(callback)
@@ -489,11 +492,20 @@ class CircadianApp(QtWidgets.QMainWindow):
         QMessageBox.about(
             self,
             "About easyClock",
-            "🕓 easyClock v1.5\n\n"
+            "🕓 easyClock v1.6\n\n"
             "Developed by: Binbin Wu Ph.D.\n"
             "Ja Lab, UF Scripps Institute, University of Florida\n"
             "© 2025. All rights reserved.\n\n"
-            "Please cite this paper:\neasyClock: A User-Friendly Desktop Application for Circadian Rhythm Analysis and Visualization.\n\n")
+            "Please cite:\neasyClock: A User-Friendly Desktop Application for Circadian Rhythm Analysis and Visualization.\n\n")
+
+    def show_Notes(self):
+        QMessageBox.about(
+            self,
+            "About Instructions",
+            "This app can input up to 3 files in the same time, click cancel to skip 1 or 2 file input.\n\n"
+            "This app is desigined for analyzing circadian rhythms, so at least 48 hr data is required for analysis.\n\n"
+            "Read Figure 2 of the following paper for understading the correct data format:\n\n"
+            "easyClock: A User-Friendly Desktop Application for Circadian Rhythm Analysis and Visualization.")
 
     def show_Feedback(self):
         QMessageBox.about(
@@ -505,17 +517,7 @@ class CircadianApp(QtWidgets.QMainWindow):
             "Dr. Qiankun He (Zhengzhou University)\n\n"
             "- - - - Feedback - - - -\n"
             "Email me < binbinwu.phd@gmail.com >")
-        
-    def show_Notes(self):
-        QMessageBox.about(
-            self,
-            "About Instructions",
-            "This app can input 1 to 3 files in the same time, click cancel to skip file input.\n\n"
-            "Data file format (.csv):\n"
-            "1st column [time series (hr)], e.g., 0...48...with any time intervals;\n\n"
-            "1st row [sample names] e.g., fly_1, fly_2 ... ;\n\n"
-            "This app is desigined for analyzing circadian rhythms, so at least 48 hr data is required for analysis.\n\n")
-            
+
             
     def rename_legend_labels(self):
         if not self.group_assignments:
@@ -759,7 +761,7 @@ class CircadianApp(QtWidgets.QMainWindow):
 
     def remove_shaded_span(self):
         dtype, ok = QInputDialog.getItem(
-            self, "Select Plot", "Remove span from which Plot?",
+            self, "Select Plot", "Remove span from which plot?",
             list(self.shaded_spans.keys()), 0, False
         )
         if not ok or dtype not in self.shaded_spans or not self.shaded_spans[dtype]:
@@ -797,12 +799,27 @@ class CircadianApp(QtWidgets.QMainWindow):
             group, ok2 = QInputDialog.getItem(self, "Choose Group", "Select group:", list(self.group_means[dtype].keys()), 0, False)
             if not ok2:
                 return
-                
-                
+            
+            span_text, ok3 = QInputDialog.getText(self, "Shaded Spans", "Enter start and end hours for shaded span (e.g., 12-24,36-48):\nLeave it blank for no shaded spans:")
+            if not ok3:
+                return
+            span_list = []
+            if span_text.strip():  # Only parse if something was entered
+                try:
+                    for part in span_text.split(','):
+                        start_str, end_str = part.strip().split('-')
+                        start, end = float(start_str), float(end_str)
+                        if start >= end:
+                            raise ValueError("Start must be less than end.")
+                        span_list.append((start, end))
+                except Exception:
+                    QMessageBox.warning(self, "Input Error", "Please check your input special symbol like - or ,")
+                    return
+            
+            
             series = self.group_means[dtype][group]
             values = series.values
             times = series.index.to_numpy()
-            
 
                 # Determine time resolution and reshape
             dt = times[1] - times[0]
@@ -810,26 +827,59 @@ class CircadianApp(QtWidgets.QMainWindow):
             total_points = len(values)
             n_days = total_points // points_per_day
             fig, ax = plt.subplots(figsize=(10, 6))
-                
+            daily_max = np.max(values) * 1.2
+            
+            # Draw shaded background spans
+            for s, e in span_list:
+            # Go through each day
+                for day in range(n_days):
+                    y_offset = day * daily_max
+                    start = day * points_per_day
+                    mid = start + points_per_day
+                    end = mid + points_per_day
+                    if end > len(values):
+                        continue
+                    left_hours = times[start:mid]
+                    right_hours = times[mid:end]
+                    x_left = np.arange(0, 24, dt)
+                    x_right = np.arange(24, 48, dt)
+                    
+                    # Shade left side
+                    for i, real_hour in enumerate(left_hours):
+                        if s <= real_hour < e:
+                            rect = Rectangle((x_left[i], y_offset), dt, daily_max,facecolor='gray', alpha=0.3, edgecolor=None)
+                            ax.add_patch(rect) 
+
+                    # Shade right side
+                    for i, real_hour in enumerate(right_hours):
+                        if s <= real_hour < e:
+                            rect = Rectangle((x_right[i], y_offset), dt, daily_max,facecolor='gray', alpha=0.3, edgecolor=None)
+                            ax.add_patch(rect) 
+
+        # Draw actogram bars
+            
             for day in range(n_days):
                 start = day * points_per_day
                 mid= start + points_per_day
                 end = mid + points_per_day
-                
-                left = values[start:mid]  # left side plot ends with on a repeated last day.
-                
-                y_offset = day * (np.max(values) * 1.2)
-                ax.bar(np.arange(0, 24, dt), left, width=dt*0.8, bottom=y_offset, color='black')
+                y_offset = day * daily_max
                 
                 if end > total_points:
                     break
+
+                # Plot left (0–24)
+                left = values[start:mid]  # left side plot ends with on a repeated last day.
+                x_left = np.arange(0, 24, dt)
+                ax.bar(x_left, left, width=dt * 0.8, bottom=y_offset, color='black')
+
+                # Plot right (24–48)
                 right = values[mid:end] # right side plot ends with on the last day.
-                ax.bar(np.arange(24, 48, dt), right, width=dt*0.8, bottom=y_offset, color='black')
-                
-                
+                x_right = np.arange(24, 48, dt)
+                ax.bar(x_right, right, width=dt*0.8, bottom=y_offset, color='black')
+
             ax.set_xlabel("Time (hr)")
             ax.set_ylabel("Day")
-            ax.set_yticks([i * np.max(values) * 1.2 for i in range(n_days)])
+            ax.set_yticks([i * daily_max for i in range(n_days)])
             ax.set_yticklabels([f"{i+1}" for i in range(n_days)])
             ax.invert_yaxis()
             ax.set_xlim(0, 48)
@@ -911,8 +961,8 @@ class CircadianApp(QtWidgets.QMainWindow):
                     cos_res = {
                         'ADJ.P': round(row['q'], 4),
                         'PER': round(row['period'],2),
-                        'LAG': round(row['acrophase[h]'], 2),
                         'AMP': round(row['amplitude'], 4),
+                        'LAG': round(row['acrophase[h]'], 2),
                         'Method': 'Cosinor analysis'
                     }
                     # Append both results
