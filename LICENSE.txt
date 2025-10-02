@@ -1,7 +1,8 @@
 
-Copyright (c) 2025 Dr-WUBINBIN
+Copyright (C) 2025 Dr-WUBINBIN
 
-This document grants permission, without charge, to any individual obtaining a copy of this software and its associated documentation files (the “Software”) to utilize the Software.
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
