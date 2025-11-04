@@ -1,0 +1,21 @@
+# Core scientific stack
+numpy
+pandas
+scipy
+statsmodels
+matplotlib
+
+# GUI
+PyQt5
+
+# Signal processing & time-frequency analysis
+pywavelets
+scikit-learn
+
+# Packaging / app building
+pyinstaller
+
+# Optional but useful
+openpyxl
+
+
