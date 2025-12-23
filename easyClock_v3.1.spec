@@ -1,12 +1,11 @@
 
-# easyClock_v1.0.spec — updated for full-featured build
 import site
 block_cipher = None
 
 from PyInstaller.utils.hooks import collect_submodules
 
 a = Analysis(
-    ['easyClock_v1.0.py'],
+    ['easyClock_v3.1.py'],
     pathex=[site.getsitepackages()[0]],
     binaries=[],
     datas=[
@@ -14,7 +13,8 @@ a = Analysis(
     ],
     hiddenimports=collect_submodules('matplotlib')+
                   collect_submodules('scipy') +
-                  collect_submodules('statsmodels'),
+                  collect_submodules('statsmodels') +
+                  collect_submodules('pywt'),
     hookspath=[],
     runtime_hooks=[],
     excludes=[],
