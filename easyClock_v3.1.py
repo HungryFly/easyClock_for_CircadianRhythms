@@ -51,37 +51,6 @@ def acrophase_to_hours(rad_phase, period=24):
 # Python-JTK function
 # ------------------------
 
-def generate_triangle_template(length, peak_index):
-    """
-    Create triangle waveform of specified length and peak location (index).
-    """
-    template = np.zeros(length)
-    if peak_index > 0:
-        template[:peak_index] = np.linspace(1, peak_index, peak_index)
-    if length - peak_index > 0:
-        template[peak_index:] = np.linspace(length - peak_index, 1, length - peak_index)
-    return template
-
-def create_ranked_templates(n_points, period, lag_range, asymmetry=0.5):
-    """
-    Generate all shifted triangle templates of a given period and asymmetry within the lag_range.
-    """
-    peak_index = int(np.round(asymmetry * period))
-    base = generate_triangle_template(period, peak_index)
-    ranked = pd.Series(base).rank().values
-
-    # Extend the template to at least cover all timepoints
-    full_template = np.tile(ranked, int(np.ceil(n_points / period)) + 1)[:n_points]
-
-    # Generate only the requested phase shifts (lags)
-    templates = []
-    for lag in lag_range:
-        lag = int(lag % period)
-        ref = np.roll(full_template, lag)
-        templates.append((ref, lag))
-
-    return templates
-
 def generate_triangle_template_time(times, period, lag, asymmetry=0.5):
     """
     Generate a triangle template aligned to real timepoints.
@@ -99,8 +68,6 @@ def generate_triangle_template_time(times, period, lag, asymmetry=0.5):
         else:
             template[i] = (period - t_mod) / (period - peak_time) if period != peak_time else 0.0
     return pd.Series(template).rank().values
-
-
 
 
 def run_discrete_jtk(series, period_range=range(22, 27), lag_range=None, asymmetries=[0.5]):
