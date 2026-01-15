@@ -5,7 +5,7 @@ block_cipher = None
 from PyInstaller.utils.hooks import collect_submodules
 
 a = Analysis(
-    ['easyClock_v3.1.py'],
+    ['easyClock_v3.2.py'],
     pathex=[site.getsitepackages()[0]],
     binaries=[],
     datas=[
