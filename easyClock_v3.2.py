@@ -1,5 +1,6 @@
 # Fix Cosine-Kendall plotting.
 # Fix Cosinor-Kendall Acrophase.
+# Fix Individual analysis under Analysis Extension
 
 import os
 import sys
@@ -731,7 +732,7 @@ class CircadianApp(QtWidgets.QMainWindow):
         
 
         analysis_menu=menu.addMenu("Analysis Extension")
-        analysis_menu.addAction("Individual rhtyhms (AR-JTK)", self.run_individual_pythonJTK_analysis_noise)
+        analysis_menu.addAction("Individual rhtyhms (Python-JTK)", self.run_individual_pythonJTK_analysis_noise)
         analysis_menu.addAction("Linear mixed-effects (run after individual analysis)", self.run_LME_analysis)
         
         visualize_menu=menu.addMenu("Visualization")
@@ -775,7 +776,7 @@ class CircadianApp(QtWidgets.QMainWindow):
             "🕓 easyClock v3.2\n\n"
             "Developed by: Binbin Wu Ph.D.\n"
             "Ja Lab, UF Scripps Institute, University of Florida\n"
-            "© 2025. All rights reserved.\n\n"
+            "© 2026. All rights reserved.\n\n"
             "Please cite:\neasyClock: A User-Friendly Desktop Application for Circadian Rhythm Analysis and Visualization.\n\n")
 
     def show_Notes(self):
@@ -1913,7 +1914,7 @@ class CircadianApp(QtWidgets.QMainWindow):
                         'Group': group,
                         'Method': 'CWT analysis',
                         'PER': round(row['dominant_period'], 2),
-                        'AMP_normalized': round(row['mean_power'], 4),
+                        'AMP_Normalization': round(row['mean_power'], 4),
                         'PER_Variation': round(row['period_variation'], 3),
                         'AMP_Modulations': row['amplitude_modulations']
                     })
@@ -1989,12 +1990,11 @@ class CircadianApp(QtWidgets.QMainWindow):
                 series = df_wide[fly_id]
                 sliced = series.loc[(series.index >= start) & (series.index <= end)]
 
-                jtk_res, used_prewhitening = run_Python_JTK_with_noise_handling_ranked(
+                jtk_res = run_discrete_jtk(
                     sliced, period_range=period_range, lag_range=lag_range, asymmetries=asymmetries)
 
                 if jtk_res:
                     raw_pvals.append(jtk_res["P"])
-                    #method_str = jtk_res.get('Method', 'AR-JTK')
                     
                     # Store Fly_ID and assign Group from mapping ---
                     group_assigned = id_to_group_map.get(fly_id, 'Unknown')
@@ -2002,7 +2002,7 @@ class CircadianApp(QtWidgets.QMainWindow):
                     selected = {
                         'Fly_ID': fly_id,
                         'Group': group_assigned, 
-                        'Method': 'AR-JTK', 
+                        'Method': 'Python-JTK', 
                         **{output_fields[k]: jtk_res[k] for k in output_fields if k in jtk_res}
                     }
                     self.result_table.append(selected)
@@ -2011,7 +2011,7 @@ class CircadianApp(QtWidgets.QMainWindow):
                     triangle_rank = generate_triangle_template_time(sliced.index.to_numpy(), jtk_res['PER'], jtk_res['LAG'], jtk_res['ASYM'])
                     tau_sign = np.sign(jtk_res.get('TAU', 1.0))
                     triangle_rank *= tau_sign
-                    triangle_norm = (triangle_rank - np.min(triangle_rank)) / (np.max(triangle_rank) - np.min(triangle_rank)) * 2 - 1
+                    triangle_norm = (triangle_rank - np.min(triangle_rank)) / np.ptp(triangle_rank)
                     mesor = sliced.mean()
                     amp = jtk_res['AMP']
                     fit_curve = mesor + amp * triangle_norm
