@@ -1,7 +1,5 @@
-# add plot_cosinor_fitting_model under Visualization functionality
-# add plot_cosinor_kendall_fitting_model under Visualization functionality
-# add plot_python_JTK_fitting_model under Visualization functionality
-# add plot_harmonic_cosinor_fitting_model under Visualization functionality
+# Add visulization for CWT.
+# Add sem for plot visualization.
 
 
 import os
@@ -13,13 +11,20 @@ import pandas as pd
 import numpy as np
 import colorsys
 import statsmodels.api as sm
+import statsmodels.formula.api as smf
+import pywt
+import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
 from scipy.stats import kendalltau
+from scipy.signal import find_peaks
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.tsa.ar_model import AutoReg,ar_select_order
 from scipy.optimize import curve_fit
 from PyQt5 import QtWidgets, QtCore
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QMessageBox, QInputDialog, QDialog, QVBoxLayout, QHBoxLayout,QComboBox,QFileDialog,QDialogButtonBox,
-    QLabel, QPushButton, QTextEdit, QScrollArea, QWidget, QSizePolicy, QColorDialog,QLineEdit
+    QMessageBox, QInputDialog, QDialog, QVBoxLayout, QHBoxLayout,QComboBox,QFileDialog,QDialogButtonBox,QApplication,
+    QLabel, QPushButton, QTextEdit, QScrollArea, QWidget, QSizePolicy, QColorDialog,QLineEdit,QProgressDialog
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -46,37 +51,6 @@ def acrophase_to_hours(rad_phase, period=24):
 # Python-JTK function
 # ------------------------
 
-def generate_triangle_template(length, peak_index):
-    """
-    Create triangle waveform of specified length and peak location (index).
-    """
-    template = np.zeros(length)
-    if peak_index > 0:
-        template[:peak_index] = np.linspace(1, peak_index, peak_index)
-    if length - peak_index > 0:
-        template[peak_index:] = np.linspace(length - peak_index, 1, length - peak_index)
-    return template
-
-def create_ranked_templates(n_points, period, lag_range, asymmetry=0.5):
-    """
-    Generate all shifted triangle templates of a given period and asymmetry within the lag_range.
-    """
-    peak_index = int(np.round(asymmetry * period))
-    base = generate_triangle_template(period, peak_index)
-    ranked = pd.Series(base).rank().values
-
-    # Extend the template to at least cover all timepoints
-    full_template = np.tile(ranked, int(np.ceil(n_points / period)) + 1)[:n_points]
-
-    # Generate only the requested phase shifts (lags)
-    templates = []
-    for lag in lag_range:
-        lag = int(lag % period)
-        ref = np.roll(full_template, lag)
-        templates.append((ref, lag))
-
-    return templates
-
 def generate_triangle_template_time(times, period, lag, asymmetry=0.5):
     """
     Generate a triangle template aligned to real timepoints.
@@ -96,8 +70,6 @@ def generate_triangle_template_time(times, period, lag, asymmetry=0.5):
     return pd.Series(template).rank().values
 
 
-
-
 def run_discrete_jtk(series, period_range=range(22, 27), lag_range=None, asymmetries=[0.5]):
     """
     Run JTK using triangle templates aligned to actual timepoints (non-uniform supported).
@@ -112,6 +84,7 @@ def run_discrete_jtk(series, period_range=range(22, 27), lag_range=None, asymmet
     best_per = None
     best_lag = None
     best_asym = None
+    best_ref = None
 
     test_results = []
 
@@ -128,9 +101,12 @@ def run_discrete_jtk(series, period_range=range(22, 27), lag_range=None, asymmet
                     best_per = period
                     best_lag = lag
                     best_asym = asym
+                    best_ref = ref
 
     bonf_p = min(1.0, best_p * len(test_results))
     amp = (np.percentile(series.values, 90) - np.percentile(series.values, 10)) / 2
+
+
     acrophase = (
         (best_lag + best_asym * best_per+ best_per / 2) % best_per if best_tau < 0
         else (best_lag + best_asym * best_per) % best_per
@@ -138,6 +114,7 @@ def run_discrete_jtk(series, period_range=range(22, 27), lag_range=None, asymmet
 
 
     return {
+        'P': round(best_p, 6),
         'ADJ.P': round(bonf_p, 6),
         'PER': round(best_per, 2),
         'AMP': round(amp, 4),
@@ -148,6 +125,96 @@ def run_discrete_jtk(series, period_range=range(22, 27), lag_range=None, asymmet
         'Method': 'Python-JTK'
     }
 
+
+
+# ------------------------
+# Noise handling functions
+# ------------------------
+
+def is_white_noise_ranked(residuals, lags=10):
+    """
+    Returns True (white-noise) if p-value > 0.05.
+    """
+    residuals = residuals.dropna()
+    if len(residuals) < lags + 1:
+        return True
+    try:
+        lb_test = acorr_ljungbox(residuals, lags=[lags],return_df=True)
+        p_value = lb_test['lb_pvalue'].iloc[0]
+        return p_value > 0.05
+    except Exception:
+        return True
+
+
+
+def prewhiten_ranked_residuals(residuals, maxlag=1):
+
+    #Fit AR to rank residuals and return whitened residuals aligned to original index.
+    #residuals: pandas Series (rank-domain noise)
+
+    e = residuals.dropna()
+    if len(e) < maxlag + 2:
+        return residuals  # not enough data
+
+    try:
+        model = AutoReg(e, lags=maxlag, old_names=False).fit()
+        phi = model.params.values  # AR coefficients
+
+        # Prewhiten: e_pw[t] = e[t] - sum(phi[k] * e[t-k])
+        e_pw = e.copy()
+        for i in range(maxlag, len(e)):
+            e_pw.iloc[i] = e.iloc[i] - np.dot(phi[1:], e.iloc[i-maxlag:i][::-1])
+
+        # Align with original residual index (first few NaNs)
+        e_pw = pd.Series(e_pw, index=e.index)
+        return e_pw
+
+    except Exception as e:
+        print(f"AR prewhitening failed: {e}")
+        return residuals
+
+
+
+def run_Python_JTK_with_noise_handling_ranked(
+    series, period_range, lag_range, asymmetries, ar_lag=1, ljungbox_lag=10
+):
+    # initial JTK
+    temp_res = run_discrete_jtk(series, period_range=period_range,
+                                lag_range=lag_range, asymmetries=asymmetries)
+    if not temp_res or temp_res.get('PER') is None:
+        return temp_res, False
+
+    times = series.index.to_numpy()
+
+    # best template for that PER/LAG/ASYM
+    template_vals = generate_triangle_template_time(
+        times, temp_res['PER'], temp_res['LAG'], temp_res['ASYM']
+    )
+    template_rank = pd.Series(template_vals, index=series.index).rank()
+
+    # rank series & compute rank-residuals
+    r = series.rank()
+    e = r - template_rank
+
+    # Autocorrelation test on rank-residuals
+    if is_white_noise_ranked(e, lags=ljungbox_lag):
+        return temp_res, False  # no AR detected
+
+    # AR prewhiten **residuals only**
+    e_pw = prewhiten_ranked_residuals(e, maxlag=ar_lag)
+
+    # reconstruct whitened rank-series
+    r_pw = template_rank + e_pw  # preserve rhythm, whiten noise
+
+    # JTK on reconstructed prewhitened series
+    jtk_res = run_discrete_jtk(r_pw, period_range=period_range,
+                               lag_range=lag_range, asymmetries=asymmetries)
+    if jtk_res:
+        jtk_res['Method'] = 'AR-JTK'
+        amp = (np.percentile(series.values, 90) - np.percentile(series.values, 10)) / 2
+        jtk_res['AMP'] = round(amp, 4)
+
+    return jtk_res, True
 
 
 # ------------------------
@@ -163,7 +230,7 @@ def run_Cosine_Kendall(series, period_range=[20,20.5,21,21.5,22,22.5,23,23.5,24,
     best_lag = None
 
     test_results = []
-    t = np.arange(n) * interval # time vector in real units
+    t = series.index.to_numpy()
     for period in period_range:
         for lag in np.arange(0, period, 0.5):
             radians = 2 * np.pi * (t - lag) / period
@@ -187,8 +254,8 @@ def run_Cosine_Kendall(series, period_range=[20,20.5,21,21.5,22,22.5,23,23.5,24,
         'ADJ.P': round(bonf_p, 6),
         'PER': round(best_per, 2),
         'AMP': round(amp, 4),
-        'LAG': round(best_lag, 2),
         'Acrophase': round(corrected_lag, 2),
+        'corrected_lag': round(corrected_lag, 2),
         'Method': 'Cosine-Kendall'
     }
 
@@ -205,8 +272,10 @@ def fit_group_cosinor(df, period_list=[20,20.5,21,21.5,22,22.5,23,23.5,24,24.5,2
         x = subset['x'].values
         y = subset['y'].values
 
+        test_results = []
         best_aic = np.inf
         best_result = None
+        best_p = 1.0
 
         for per in period_list:
             omega = 2 * np.pi / per
@@ -214,6 +283,9 @@ def fit_group_cosinor(df, period_list=[20,20.5,21,21.5,22,22.5,23,23.5,24,24.5,2
             sin_term = np.sin(omega * x)
             X = np.column_stack([np.ones(len(x)), cos_term, sin_term])
             model = sm.OLS(y, X).fit()
+            
+            pval = model.f_pvalue
+            test_results.append(pval)
 
             if model.aic < best_aic:
                 beta_cos, beta_sin = model.params[1], model.params[2]
@@ -235,29 +307,28 @@ def fit_group_cosinor(df, period_list=[20,20.5,21,21.5,22,22.5,23,23.5,24,24.5,2
                 ci_phase = (phase - 1.96 * se_phase, phase + 1.96 * se_phase)
 
                 best_aic = model.aic
+                best_p = pval
                 best_result = {
                     'test': test,
                     'period': per,
-                    'p': model.f_pvalue,
+                    'p': pval,
                     'mesor': model.params[0],
                     'amplitude': amp,
                     'p(amplitude)': model.pvalues[1],
                     'CI(amplitude)': [ci_amp[0], ci_amp[1]],
-                    'acrophase': phase,
+                    'acrophase': acrophase_to_hours(phase, per),
                     'p(acrophase)': model.pvalues[2],
                     'CI(acrophase)': [ci_phase[0], ci_phase[1]],
-                    'Acrophase': acrophase_to_hours(phase, per)
+                    'Acrophase': (-phase) * per / (2 * np.pi)
                 }
 
         if best_result:
+            m = len(test_results)
+            bonf_p = min(1.0, best_p * m)
+            best_result['ADJ.P'] = bonf_p
             results.append(best_result)
 
     df_results = pd.DataFrame(results)
-    if not df_results.empty:
-        df_results['q'] = multipletests(df_results['p'], method='fdr_bh')[1]
-        df_results['q(amplitude)'] = multipletests(df_results['p(amplitude)'], method='fdr_bh')[1]
-        df_results['q(acrophase)'] = multipletests(df_results['p(acrophase)'], method='fdr_bh')[1]
-
     return df_results
     
 # ------------------------
@@ -311,6 +382,9 @@ def fit_group_harmonic_cosinor(df, period_range=[20,20.5,21,21.5,22,22.5,23,23.5
     for h in range(1, harmonics + 1):
         model_wave_full += np.cos(2 * np.pi * h * (t_grid_full - best_lag) / best_per)
     
+    if best_tau < 0:
+        model_wave      *= -1
+        model_wave_full *= -1
     
     #Find peaks (local maxima)
     from scipy.signal import find_peaks
@@ -368,6 +442,85 @@ def fit_group_harmonic_cosinor(df, period_range=[20,20.5,21,21.5,22,22.5,23,23.5
         'Acrophase2': round(acrophases[1], 2),
         'Method': 'Harmonic-Cosinor'
     }]), fit_model
+
+
+
+# ------------------------
+# Continuous Wavelet Transform (CWT) 
+# non-stationary circadian signals with time-varying analysis
+# ------------------------
+
+def fit_group_cwt(df, sampling_interval=0.5, wavelet='cmor1.5-1.0'):
+
+    results = []
+    for test in df['test'].unique():
+        subset = df[df['test'] == test].sort_values('x')
+        x = subset['x'].values
+        y = subset['y'].values
+
+        # Detrend the signal to highlight oscillations
+        y_detrended = y - np.mean(y)
+
+        # Scales corresponding to ~20–28 h periods (assuming 1 sample per 0.5 h)
+        # wavelet scales roughly relate to period ≈ scale * sampling_interval
+        period_range = np.arange(20, 28.1, 0.1)
+        scales = period_range / sampling_interval
+
+        # Perform the continuous wavelet transform
+        coef, freqs = pywt.cwt(y_detrended, scales, wavelet, sampling_period=sampling_interval)
+        power = np.abs(coef) ** 2
+
+        # Average power across time to get global wavelet spectrum
+        global_power = power.mean(axis=1)
+        dominant_idx = np.argmax(global_power)
+        dominant_period = period_range[dominant_idx]
+        dominant_power = global_power[dominant_idx]
+
+        # Estimate period drift: find dominant period per timepoint
+        dom_periods_over_time = period_range[np.argmax(power, axis=0)]
+        period_variation = np.std(dom_periods_over_time)
+
+        # Optional: detect amplitude modulation
+        mean_power = np.mean(power, axis=0)
+        amp_peaks, _ = find_peaks(mean_power)
+        amp_fluctuations = len(amp_peaks)
+
+        results.append({
+            'test': test,
+            'dominant_period': round(dominant_period, 2),
+            'mean_power': round(float(np.mean(global_power)), 4),
+            'period_variation': round(float(period_variation), 3),
+            'amplitude_modulations': amp_fluctuations,
+            'Method': 'CWT analysis'
+        })
+
+    return pd.DataFrame(results)
+
+
+# ------------------------
+# linear mixed-effects model (LME)
+# ------------------------
+
+def LME_model(df, dependent, fixed_effects, random_effect):
+
+    # Construct formula string
+    fixed_str = " + ".join(fixed_effects)
+    formula = f"{dependent} ~ {fixed_str}"
+
+    # Fit model
+    model = smf.mixedlm(formula, df, groups=df[random_effect])
+    result = model.fit()
+
+    # Extract results
+    summary_df = pd.DataFrame({
+        "Term": result.params.index,
+        "Estimate": result.params.values,
+        "StdErr": result.bse.values,
+        "z-value": result.tvalues.values,
+        "p-value": result.pvalues.values
+    })
+
+    return summary_df
 
 
 class SpanDialog(QDialog):
@@ -441,14 +594,14 @@ class JTKParamDialog(QDialog):
         layout = QVBoxLayout(self)
 
         self.period_input = QLineEdit("22,23,24,25,26")
-        self.lag_input = QLineEdit("0,2,4,6,8,10,12")
-        self.asym_input = QLineEdit("0.5")  # Optional
+        self.lag_input = QLineEdit("0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23")
+        self.asym_input = QLineEdit("0.2,0.5,0.8")  # Optional
 
         layout.addWidget(QLabel("<<estimate Periods (comma-separated)>>\n note: more periods you select, the slower efficiency you get!"))
         layout.addWidget(self.period_input)
-        layout.addWidget(QLabel("<<estimate Acrophases (the peak time) (comma-separated)>>\n note: more lags you select, the slower efficiency you get!"))
+        layout.addWidget(QLabel("<<estimate Lags (when the waveform starts rising) (comma-separated)>>\n note: please use default values if you are unsure!"))
         layout.addWidget(self.lag_input)
-        layout.addWidget(QLabel("<<estimate Asymmetries (range: 0-1)>>\n 0.5 = symmetric shape\n < 0.5 = asymmetric (left half cycle is dominant)\n > 0.5 = asymmetric (right half cycle is dominant)\nExample: 0.8,0.9"))
+        layout.addWidget(QLabel("<<estimate Asymmetries (range: 0-1)>>\n = 0.5 → symmetric (equal rise and fall time)\n < 0.5 → left-skewed (rises quickly, falls slowly)\n > 0.5 → right-skewed (rises slowly, falls quickly)\nExample: 0.2,0.5,0.8"))
         layout.addWidget(self.asym_input)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -456,6 +609,36 @@ class JTKParamDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+    def get_params(self):
+        periods = [int(p.strip()) for p in self.period_input.text().split(",")]
+        lags = [int(l.strip()) for l in self.lag_input.text().split(",")]
+        asyms = [float(a.strip()) for a in self.asym_input.text().split(",")]
+        return periods, lags, asyms
+
+
+class JTKParamDialog_Noise(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("JTK Parameter Setup (Noise Handling)")
+        layout = QVBoxLayout(self)
+
+        self.period_input = QLineEdit("22,23,24,25,26")
+        self.lag_input = QLineEdit("0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23")
+        self.asym_input = QLineEdit("0.2,0.5,0.8")
+
+        layout.addWidget(QLabel("Parameters for JTK (Noise Handling)"))
+        layout.addWidget(QLabel("<<estimate Periods (comma-separated)>>\n note: more periods you select, the slower efficiency you get!"))
+        layout.addWidget(self.period_input)
+        layout.addWidget(QLabel("<<estimate Lags (when the waveform starts rising)>>\n note: please use default values if you are unsure!"))
+        layout.addWidget(self.lag_input)
+        layout.addWidget(QLabel("<<estimate Asymmetries (range: 0-1)>>\n = 0.5 → symmetric (equal rise and fall time)\n < 0.5 → left-skewed (rises quickly, falls slowly)\n > 0.5 → right-skewed (rises slowly, falls quickly)\nExample: 0.2,0.5,0.8"))
+        layout.addWidget(self.asym_input)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        
     def get_params(self):
         periods = [int(p.strip()) for p in self.period_input.text().split(",")]
         lags = [int(l.strip()) for l in self.lag_input.text().split(",")]
@@ -489,6 +672,7 @@ class CircadianApp(QtWidgets.QMainWindow):
         self.group_colors = {}
         self.shaded_spans = {}
         self.result_table = []
+        self.latest_result_df = None
         self.y_axis_limits = {
             "file_1": None,
             "file_2": None,
@@ -543,6 +727,13 @@ class CircadianApp(QtWidgets.QMainWindow):
         analysis_menu.addAction("Cosine-Kendall and Cosinor",self.run_analysis)
         analysis_menu.addAction("Python-JTK (non-parametric test)",self.run_pythonJTK_analysis)
         analysis_menu.addAction("Harmonic Cosinor (bimodal test)",self.run_fit_group_harmonic_cosinor)
+        analysis_menu.addAction("AR-JTK (AR noise handling, slower speed)", self.run_pythonJTK_analysis_noise)
+        analysis_menu.addAction("Continuous Wavelet Transform (non-stationary rhythms)", self.run_CWT_analysis)
+        
+
+        analysis_menu=menu.addMenu("Analysis Extension")
+        analysis_menu.addAction("Individual rhtyhms (Python-JTK)", self.run_individual_pythonJTK_analysis_noise)
+        analysis_menu.addAction("Linear mixed-effects (run after individual analysis)", self.run_LME_analysis)
         
         visualize_menu=menu.addMenu("Visualization")
         
@@ -558,13 +749,19 @@ class CircadianApp(QtWidgets.QMainWindow):
         cosinor_kendall_plot_action.triggered.connect(lambda:self.plot_cosinor_kendall_fitting_model())
         visualize_menu.addAction(cosinor_kendall_plot_action)
 
-        python_jtk_plot_action = QtWidgets.QAction("Plot Python-JTK Fitting", self)
+        python_jtk_plot_action = QtWidgets.QAction("Plot Python-JTK / AR-JTK Fitting", self)
         python_jtk_plot_action.triggered.connect(lambda:self.plot_python_jtk_fitting_model())
         visualize_menu.addAction(python_jtk_plot_action)
+        
         
         harmonic_cosinor_plot_action = QtWidgets.QAction("Plot Harmonic-Cosinor Fitting", self)
         harmonic_cosinor_plot_action.triggered.connect(lambda:self.plot_harmonic_cosinor_fitting_model())
         visualize_menu.addAction(harmonic_cosinor_plot_action)
+
+        
+        cwt_plot_action = QtWidgets.QAction("Plot CWT Fitting", self)
+        cwt_plot_action.triggered.connect(lambda:self.plot_cwt())
+        visualize_menu.addAction(cwt_plot_action)
 
 
         about_menu = menu.addMenu("Read Me")
@@ -581,10 +778,10 @@ class CircadianApp(QtWidgets.QMainWindow):
         QMessageBox.about(
             self,
             "About easyClock",
-            "🕓 easyClock v2.1\n\n"
+            "🕓 easyClock v3.3\n\n"
             "Developed by: Binbin Wu Ph.D.\n"
             "Ja Lab, UF Scripps Institute, University of Florida\n"
-            "© 2025. All rights reserved.\n\n"
+            "© 2026. All rights reserved.\n\n"
             "Please cite:\neasyClock: A User-Friendly Desktop Application for Circadian Rhythm Analysis and Visualization.\n\n")
 
     def show_Notes(self):
@@ -727,8 +924,11 @@ class CircadianApp(QtWidgets.QMainWindow):
         self.group_sems = {k: {} for k in self.raw_data}
         self.group_colors.clear()
 
-        fly_ids = []
-
+        fly_ids = []  # original labels (may have duplicates)
+        unique_ids = []       # unique column ids
+        self.column_label_map = {}  # maps unique_id → original label
+        reference_labels = None  # store the first file's unique labels
+        
         for dtype in self.raw_data:
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
                 self, f"Load {dtype} CSV", "", "CSV Files (*.csv)"
@@ -746,7 +946,7 @@ class CircadianApp(QtWidgets.QMainWindow):
                     time_index = header.index("Time")
                     raw_cols = header[:time_index] + header[time_index + 1:]
 
-                    # Clean headers: preserve duplicates, label unnamed ones
+                    # Clean headers: preserve duplicates(original labels), label unnamed ones
                     cleaned_labels = []
                     unnamed_counter = 1
                     for label in raw_cols:
@@ -755,23 +955,52 @@ class CircadianApp(QtWidgets.QMainWindow):
                             clean = f"Unnamed_{unnamed_counter}"
                             unnamed_counter += 1
                         cleaned_labels.append(clean)
+                        
+                    # --- Ensure unique IDs for DataFrame columns ---
+                    seen = {}
+                    unique_labels = []
+                    for label in cleaned_labels:
+                        if label not in seen:
+                            seen[label] = 1
+                            unique_labels.append(label)
+                        else:
+                            seen[label] += 1
+                            unique_labels.append(f"{label}_{seen[label]}")
 
+                     # --- Consistency check with reference ---
+                    if reference_labels is None:
+                        reference_labels = cleaned_labels[:]  # save original labels from first file
+                    else:
+                        if cleaned_labels != reference_labels:
+                            QMessageBox.warning(
+                                self,
+                                "Inconsistent Column labels between files",
+                                f"Skipped {os.path.basename(path)}\n\n"
+                                f"Column labels do not match the first dataset."
+                            )
+                            self.status.append(
+                                f"Skipped {dtype} ({os.path.basename(path)}) due to inconsistent labels."
+                            )
+                            continue  # skip this file entirely
+
+                    
                     # Load data with proper encoding and label assignment
                     df = pd.read_csv(path, index_col="Time", encoding="utf-8-sig")
-                    df.columns = cleaned_labels
+                    df.columns = unique_labels
                     self.raw_data[dtype] = df
+                    
+                    # Save mapping (unique → original)
+                    self.column_label_map.update(dict(zip(unique_labels, cleaned_labels)))
+                    # Save for group dialog (keep both lists aligned by index)
+                    fly_ids = cleaned_labels
+                    unique_ids = unique_labels
+                    
                     self.status.append(f"Loaded {dtype} from {os.path.basename(path)}")
 
                 except Exception as e:
                     QMessageBox.warning(self, "Error", f"Failed to load {dtype}: {e}")
                     self.raw_data[dtype] = None
-
-        # Extract fly_ids from the first valid dataset
-        for df in self.raw_data.values():
-            if df is not None:
-                fly_ids = df.columns.tolist()
-                break
-
+                    
         if not fly_ids:
             QMessageBox.warning(self, "No data", "No valid columns found in any dataset.")
             return
@@ -781,8 +1010,15 @@ class CircadianApp(QtWidgets.QMainWindow):
         dlg.setWindowTitle("Group Assignment")
         vbox = QVBoxLayout(dlg)
         vbox.addWidget(QLabel("Assign groups to each column:"))
+        
+        # --- Pre-fill group assignment with determinate progress bar ---
+        progress = QProgressDialog("Preparing Groups: 300~500 columns/min", "", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
 
-        # Pre-fill logic: same label → same group
+        # Pre-fill logic: same original label → same group
         label_to_group = {}
         dropdown_defaults = []
         group_counter = 1
@@ -812,22 +1048,34 @@ class CircadianApp(QtWidgets.QMainWindow):
             dropdowns[i] = drop
             row.addWidget(drop)
             form.addLayout(row)
+            
+            # Keep GUI responsive for every 50 groups
+            if i % 10 == 0 or i == len(fly_ids) - 1:
+                progress.setValue(i+1)
+                QtWidgets.QApplication.processEvents()
+                if progress.wasCanceled():
+                    progress.close()
+                    self.status.append("Group widget creation canceled.")
+                    return
 
         scroll.setWidget(inner)
         scroll.setWidgetResizable(True)
         scroll.setMinimumHeight(300)
         vbox.addWidget(scroll)
+        
+        progress.close()
 
         btn = QPushButton("Confirm")
         btn.clicked.connect(dlg.accept)
         vbox.addWidget(btn)
 
         if dlg.exec_() == QDialog.Accepted:
-            self.group_assignments = {}
+            new_assignments = {}
             for i, drop in dropdowns.items():
-                label = fly_ids[i]
+                unique_label = unique_ids[i]
                 group = drop.currentText()
-                self.group_assignments.setdefault(group, []).append(label)
+                new_assignments.setdefault(group, []).append(unique_label)
+            self.group_assignments = new_assignments
 
         # Color Assignment
         color_choice = QMessageBox.question(
@@ -848,7 +1096,13 @@ class CircadianApp(QtWidgets.QMainWindow):
                 if color.isValid():
                     self.group_colors[group] = color.name()
 
-        # Compute group means/SEMs
+        # --- Compute group means/SEMs (display progress bar) ---
+        progress = QProgressDialog("Computing group means/SEMs: 2000 groups/min...", "Cancel", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setRange(0, 0)  # spinning
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+
         for dtype, df in self.raw_data.items():
             if df is not None:
                 for group, flies in self.group_assignments.items():
@@ -857,9 +1111,31 @@ class CircadianApp(QtWidgets.QMainWindow):
                         sub = df[valid]
                         self.group_means[dtype][group] = sub.mean(axis=1)
                         self.group_sems[dtype][group] = sub.sem(axis=1)
+                        
+                        # allow UI update every ~100 groups
+                        if len(self.group_means[dtype]) % 100 == 0:
+                            QtWidgets.QApplication.processEvents()
+                            if progress.wasCanceled():
+                                progress.close()
+                                self.status.append("Group mean/SEM computation canceled.")
+                                return
+        progress.close()
 
         self.status.append("Groups and colors assigned.")
-        self.plot_all()
+        
+        # --- Ask if user wants to preview plots ---
+        preview_choice = QMessageBox.question(
+            self, "Data Preview",
+            "Do you want the data preview?\n\n"
+            "Yes  → Show plots (slower for large datasets)\n"
+            "No   → Skip plotting (faster, go straight to analysis)",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if preview_choice == QMessageBox.Yes:
+            self.plot_all()
+        else:
+            self.status.append("Skipped data preview.")
 
 
 
@@ -1069,8 +1345,8 @@ class CircadianApp(QtWidgets.QMainWindow):
                     right = right[:len(x_right)]
                 ax.bar(x_right, right, width=dt * 0.8, bottom=y_offset, color='black')
 
-            ax.set_xlabel("Time (hr)",fontsize=14)
-            ax.set_ylabel("Day",fontsize=14)
+            ax.set_xlabel("Time (hr)",fontsize=18)
+            ax.set_ylabel("Day",fontsize=18)
             ax.set_yticks([i * daily_max for i in range(n_days)])
             ax.set_yticklabels([f"{i+1}" for i in range(n_days)])
             ax.invert_yaxis()
@@ -1089,8 +1365,6 @@ class CircadianApp(QtWidgets.QMainWindow):
             QMessageBox.critical(self, "Actogram Error", str(e))
 
 
-                
-                
 
     def run_analysis(self):
         try:
@@ -1175,7 +1449,7 @@ class CircadianApp(QtWidgets.QMainWindow):
                 # Save Kendall results
                 self.kendall_fits_by_dtype[dtype][group] = {
                     'PER': jtk_res['PER'],
-                    'LAG': jtk_res['Acrophase'],
+                    'LAG': jtk_res['corrected_lag'],
                     'AMP': jtk_res['AMP']
                 }
 
@@ -1190,7 +1464,7 @@ class CircadianApp(QtWidgets.QMainWindow):
                 if not cos_res_df.empty:
                     row = cos_res_df.iloc[0]
                     cos_res = {
-                        'ADJ.P': round(row['q'], 4),
+                        'ADJ.P': round(row['ADJ.P'], 4),
                         'PER': round(row['period'],2),
                         'AMP': round(row['amplitude'], 4),
                         'Acrophase': round(row['Acrophase'], 2),
@@ -1200,7 +1474,7 @@ class CircadianApp(QtWidgets.QMainWindow):
                     # Save for plotting of regression model
                     self.best_cosinor_fits_by_dtype[dtype][group] = {
                         'period': row['period'],
-                        'acrophase': row['Acrophase'],
+                        'acrophase': row['acrophase'],
                         'amplitude': row['amplitude'],
                         'mesor': row['mesor']
                     }
@@ -1218,7 +1492,13 @@ class CircadianApp(QtWidgets.QMainWindow):
                     })
 
             if self.result_table:
-                self.status.setText(pd.DataFrame(self.result_table).to_string(index=False, col_space=20))
+                df_out = pd.DataFrame(self.result_table)
+                
+                # Store latest full results for LME analysis
+                self.latest_result_df = df_out.copy()
+                
+                # display full results on dashboard
+                self.status.setText(df_out.to_string(index=False, col_space=20))
             else:
                 QMessageBox.information(self, "No Results", "No groups met the criteria.")
 
@@ -1266,6 +1546,14 @@ class CircadianApp(QtWidgets.QMainWindow):
             self.last_analyzed_dtype = dtype
             self.last_analyzed_timerange = (start, end)
             self.result_table = []
+            
+            groups = list(df.items())
+            n_groups = len(groups)
+            # --- Create progress dialog ---
+            progress = QProgressDialog("Running Python-JTK...", "Cancel", 0, n_groups, self)
+            progress.setWindowTitle("Analysis Progress")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
 
              # Store best fitting python_jtk template
             if not hasattr(self, 'python_jtk_fits_by_dtype'):
@@ -1277,15 +1565,22 @@ class CircadianApp(QtWidgets.QMainWindow):
                 'ADJ.P': 'ADJ.P',
                 'PER': 'PER',
                 'AMP': 'AMP',
-                'Acrophase': 'Acrophase'
+                'Acrophase': 'Acrophase',
+                'ASYM': 'ASYM',
+                'TAU' : 'TAU'
             }
 
-            for group, series in df.items():
+            raw_pvals = []  # store only internally
+            
+            for i, (group, series) in enumerate(groups):
+                if progress.wasCanceled():
+                    break
                 sliced = series.loc[(series.index >= start) & (series.index <= end)]
                 jtk_res = run_discrete_jtk(
                     sliced, period_range=period_range, lag_range=lag_range, asymmetries=asymmetries)
 
                 if jtk_res:
+                    raw_pvals.append(jtk_res["P"])  # keep raw p for BH.Q
                     selected = {
                         'Group': group,
                         'Method': 'Python-JTK',
@@ -1318,13 +1613,147 @@ class CircadianApp(QtWidgets.QMainWindow):
                 except Exception as e:
                     print(f"Fit generation failed for group {group}: {e}")
 
-
+                # --- update progress bar ---
+                progress.setValue(i + 1)
+                QApplication.processEvents()
+                
             df_out = pd.DataFrame(self.result_table)
+            # --- Apply BH correction across all groups ---
+            if raw_pvals:
+                _, bh_qvals, _, _ = multipletests(raw_pvals, method='fdr_bh')
+                df_out["BH.Q"] = np.round(bh_qvals, 6)
+                
+                # --- update self.result_table as list of dicts including BH.Q ---
+                for i, q in enumerate(np.round(bh_qvals, 6)):
+                    self.result_table[i]["BH.Q"] = q
+            
+            # Store latest full results for LME analysis
+            self.latest_result_df = df_out.copy()
+            # --- Display results ---
             self.status.setText(df_out.to_string(index=False, col_space=20))
+            
+            # --- Ensure progress reaches the end ---
+            progress.setValue(n_groups)
 
         except Exception as e:
             QMessageBox.critical(self, "Analysis Error", str(e))
+
+
+
+
+    def run_pythonJTK_analysis_noise(self):
+        # New JTK analysis with noise handling
+        try:
+            dtype, ok = QInputDialog.getItem(
+                self, "Select Dataset", "Which File?",
+                ["file_1", "file_2", "file_3"], 0, False)
+            if not ok: return
+
+            df = self.group_means.get(dtype)
+            if not df:
+                QMessageBox.warning(self, "Missing Data", "Please load data first.")
+                return
+
+            time_index = df[next(iter(df))].index
+            min_time, max_time = float(time_index.min()), float(time_index.max())
             
+            start, ok1 = QInputDialog.getDouble(self, "Start Time", f"Start time index ({min_time}–{max_time}):", min_time, min_time, max_time, decimals=1)
+            if not ok1: return
+            end, ok2 = QInputDialog.getDouble(self, "End Time", f"End time index({min_time}–{max_time}):", start + 1, start + 1, max_time, decimals=1)
+            if not ok2 or end <= start: return
+
+            dlg = JTKParamDialog_Noise(self)
+            if dlg.exec_() != QDialog.Accepted: return
+            period_range, lag_range, asymmetries = dlg.get_params()
+
+            self.last_analyzed_dtype = dtype
+            self.last_analyzed_timerange = (start, end)
+            self.result_table = []
+            
+            groups = list(df.items())
+            n_groups = len(groups)
+            progress = QProgressDialog("Running Python-JTK (noise handling)...", "Cancel", 0, n_groups, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+
+            if not hasattr(self, 'python_jtk_fits_by_dtype'): self.python_jtk_fits_by_dtype = {}
+            self.python_jtk_fits_by_dtype[dtype] = {}
+
+            output_fields = {'ADJ.P': 'ADJ.P', 'PER': 'PER', 'AMP': 'AMP', 'Acrophase': 'Acrophase', 'ASYM': 'ASYM', 'TAU' : 'TAU'}
+            raw_pvals = []
+
+            for i, (group, series) in enumerate(groups):
+                if progress.wasCanceled(): break
+                sliced = series.loc[(series.index >= start) & (series.index <= end)]
+                
+                
+                # --- Baseline Python-JTK (for phase/template) ---
+                base_jtk = run_discrete_jtk(
+                    sliced, period_range=period_range, lag_range=lag_range, asymmetries=asymmetries
+                )
+
+                # --- AR-JTK (for significance only) ---
+                jtk_res, used_prewhitening = run_Python_JTK_with_noise_handling_ranked(
+                    sliced, period_range=period_range, lag_range=lag_range, asymmetries=asymmetries)
+
+                if jtk_res:
+                    if base_jtk:
+                        jtk_res['PER'] = base_jtk['PER']
+                        jtk_res['LAG'] = base_jtk['LAG']
+                        jtk_res['ASYM'] = base_jtk['ASYM']
+                        jtk_res['Acrophase'] = base_jtk['Acrophase']
+                        jtk_res['TAU'] = base_jtk['TAU']  # Tau sign used only for phase
+
+                    raw_pvals.append(jtk_res["P"])
+                    selected = {'Group': group, 'Method': 'AR-JTK', **{output_fields[k]: jtk_res[k] for k in output_fields if k in jtk_res}}
+                    self.result_table.append(selected)
+
+                    # Save fit curve for plotting
+                try:
+                    triangle_rank = generate_triangle_template_time(sliced.index.to_numpy(), base_jtk['PER'], base_jtk['LAG'], base_jtk['ASYM'])
+                    #Flip if tau < 0
+                    tau_sign = np.sign(base_jtk.get('TAU', 1.0))
+                    triangle_rank *= tau_sign
+                    
+                    # Normalize triangle wave to [-1, 1] and rescale
+                    triangle_norm = (triangle_rank - np.mean(triangle_rank)) / np.ptp(triangle_rank)
+                    mesor = sliced.mean()
+                    amp = base_jtk['AMP']
+                    fit_curve = mesor + amp * triangle_norm
+                    
+                    self.python_jtk_fits_by_dtype[dtype][group] = {
+                        'Time': sliced.index.to_numpy(),
+                        'Fit': fit_curve,
+                        'Raw': sliced.values,
+                    }
+                except Exception as e:
+                    print(f"Fit generation failed for group {group}: {e}")
+                progress.setValue(i + 1)
+                QApplication.processEvents()
+                
+            df_out = pd.DataFrame(self.result_table)
+
+
+            # --- Apply BH correction across all groups ---
+            if raw_pvals:
+                _, bh_qvals, _, _ = multipletests(raw_pvals, method='fdr_bh')
+                df_out["BH.Q"] = np.round(bh_qvals, 6)
+                
+                # --- update self.result_table as list of dicts including BH.Q ---
+                for i, q in enumerate(np.round(bh_qvals, 6)):
+                    self.result_table[i]["BH.Q"] = q
+            
+            # Store latest full results for LME analysis
+            self.latest_result_df = df_out.copy()
+            
+            # --- Display results ---
+            self.status.setText(df_out.to_string(index=False, col_space=20))
+            
+            # --- Ensure progress reaches the end ---
+            progress.setValue(n_groups)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Analysis Error", str(e))
 
 
 
@@ -1402,7 +1831,13 @@ class CircadianApp(QtWidgets.QMainWindow):
 
 
             if self.result_table:
-                self.status.setText(pd.DataFrame(self.result_table).to_string(index=False, col_space=20))
+                df_out = pd.DataFrame(self.result_table)
+                
+                # Store latest full results for LME analysis
+                self.latest_result_df = df_out.copy()
+                
+                # display results on dashboard
+                self.status.setText(df_out.to_string(index=False, col_space=20))
             else:
                 QMessageBox.information(self, "No Results", "No groups met the criteria.")
                 
@@ -1412,6 +1847,276 @@ class CircadianApp(QtWidgets.QMainWindow):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
+
+
+
+    def run_CWT_analysis(self):
+        try:
+            dtype, ok = QInputDialog.getItem(
+                self, "Select Dataset", "Which File?", ["file_1", "file_2", "file_3"], 0, False)
+            if not ok:
+                return
+
+            if not self.group_means[dtype]:
+                QMessageBox.warning(self, "Error", f"No {dtype} data loaded.")
+                return
+
+            df = self.group_means.get(dtype)
+            if not df:
+                QMessageBox.warning(self, "Missing Data", "Please load data first.")
+                return
+
+
+            time_index = df[next(iter(df))].index
+            min_time = float(time_index.min())
+            max_time = float(time_index.max())
+
+            start, ok2 = QInputDialog.getDouble(
+                self, "Start Time", f"Start time (from Time index {min_time}–{max_time}):", 
+                min_time, min_time, max_time,decimals=1)
+            if not ok2:
+                return
+            end, ok3 = QInputDialog.getDouble(
+                self, "End Time", f"End time (from Time index {min_time}–{max_time}):",
+                min_time, min_time, max_time,decimals=1)
+            if not ok3 or end <= start:
+                QMessageBox.warning(self, "Invalid Range", "End time must be greater than start time.")
+                return
+
+            self.last_analyzed_dtype = dtype
+            self.last_analyzed_timerange = (start, end)
+            self.result_table = []
+
+
+            for group, series in df.items():
+                # Use .loc to slice by actual time index values
+                sliced = series.loc[start:end]
+                time = sliced.index.to_numpy()
+                
+                if len(time) < 2:
+                    continue
+                
+                interval = np.diff(time).mean()
+                duration = interval * len(time)
+                
+                if duration < 48:
+                    QMessageBox.warning(self, "Too Short", f"{group} has less than 48h of data.")
+                    continue
+                
+
+                # --- CWT ---
+                cwt_df = pd.DataFrame({
+                    'test': [group] * len(sliced),
+                    'x': time,
+                    'y': sliced.values
+                })
+                cwt_res_df = fit_group_cwt(cwt_df, sampling_interval=interval)
+                if not cwt_res_df.empty:
+                    row = cwt_res_df.iloc[0]
+
+                    # Append results
+                    self.result_table.append({
+                        'Group': group,
+                        'Method': 'CWT analysis',
+                        'PER': round(row['dominant_period'], 2),
+                        'AMP_Normalization': round(row['mean_power'], 4),
+                        'PER_Variation': round(row['period_variation'], 3),
+                        'AMP_Modulations': row['amplitude_modulations']
+                    })
+
+            if self.result_table:
+                df_out = pd.DataFrame(self.result_table)
+                
+                # Store latest full results for LME analysis
+                self.latest_result_df = df_out.copy()
+                
+                # display results
+                self.status.setText(df_out.to_string(index=False, col_space=20))
+            else:
+                QMessageBox.information(self, "No Results", "No groups met the criteria.")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+
+    #---------------------
+    # Individual analysis
+    #---------------------
+    def run_individual_pythonJTK_analysis_noise(self):
+        # New JTK analysis with noise handling
+        try:
+            dtype, ok = QInputDialog.getItem(
+                self, "Select Dataset", "Which File?",
+                list(self.raw_data.keys()), 0, False) # Use keys from raw data
+            if not ok: return
+
+            # Use raw data with individual columns (flies/replicates)
+            df_wide = self.raw_data.get(dtype) 
+            if df_wide is None or df_wide.empty:
+                QMessageBox.warning(self, "Missing Data", "Please load data first.")
+                return
+
+            time_index = df_wide.index
+            min_time, max_time = float(time_index.min()), float(time_index.max())
+            
+            start, ok1 = QInputDialog.getDouble(self, "Start Time", f"Start time index ({min_time}–{max_time}):", min_time, min_time, max_time, decimals=1)
+            if not ok1: return
+            end, ok2 = QInputDialog.getDouble(self, "End Time", f"End time index({min_time}–{max_time}):", start + 1, start + 1, max_time, decimals=1)
+            if not ok2 or end <= start: return
+
+            dlg = JTKParamDialog_Noise(self)
+            if dlg.exec_() != QDialog.Accepted: return
+            period_range, lag_range, asymmetries = dlg.get_params()
+
+            self.last_analyzed_dtype = dtype
+            self.last_analyzed_timerange = (start, end)
+            self.result_table = []
+
+            # Create the temporary ID-to-Group lookup map
+            id_to_group_map = {}
+            for group_name, fly_ids_list in self.group_assignments.items():
+                for fly_id in fly_ids_list:
+                    id_to_group_map[fly_id] = group_name
+            
+            fly_ids = df_wide.columns.tolist()
+            n_flies = len(fly_ids)
+            progress = QProgressDialog("Running Python-JTK (per replicate)...", "Cancel", 0, n_flies, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+
+            if not hasattr(self, 'python_jtk_fits_by_dtype'): self.python_jtk_fits_by_dtype = {}
+            self.python_jtk_fits_by_dtype[dtype] = {}
+
+            output_fields = {'ADJ.P': 'ADJ.P', 'PER': 'PER', 'AMP': 'AMP', 'Acrophase': 'Acrophase', 'ASYM': 'ASYM', 'TAU' : 'TAU'}
+            raw_pvals = []
+
+            for i, fly_id in enumerate(fly_ids):
+                if progress.wasCanceled(): break
+                series = df_wide[fly_id]
+                sliced = series.loc[(series.index >= start) & (series.index <= end)]
+
+                jtk_res = run_discrete_jtk(
+                    sliced, period_range=period_range, lag_range=lag_range, asymmetries=asymmetries)
+
+                if jtk_res:
+                    raw_pvals.append(jtk_res["P"])
+                    
+                    # Store Fly_ID and assign Group from mapping ---
+                    group_assigned = id_to_group_map.get(fly_id, 'Unknown')
+                    
+                    selected = {
+                        'Fly_ID': fly_id,
+                        'Group': group_assigned, 
+                        'Method': 'Python-JTK', 
+                        **{output_fields[k]: jtk_res[k] for k in output_fields if k in jtk_res}
+                    }
+                    self.result_table.append(selected)
+
+                    # Save fit curve for plotting
+                    triangle_rank = generate_triangle_template_time(sliced.index.to_numpy(), jtk_res['PER'], jtk_res['LAG'], jtk_res['ASYM'])
+                    tau_sign = np.sign(jtk_res.get('TAU', 1.0))
+                    triangle_rank *= tau_sign
+                    triangle_norm = (triangle_rank - np.min(triangle_rank)) / np.ptp(triangle_rank)
+                    mesor = sliced.mean()
+                    amp = jtk_res['AMP']
+                    fit_curve = mesor + amp * triangle_norm
+                    
+                    # Store fit curve keyed by the unique Fly_ID
+                    self.python_jtk_fits_by_dtype[dtype][fly_id] = {
+                        'Time': sliced.index.to_numpy(),
+                        'Fit': fit_curve,
+                        'Raw': sliced.values,
+                    }
+
+                progress.setValue(i + 1)
+                QApplication.processEvents()
+                
+            df_out = pd.DataFrame(self.result_table)
+
+            # --- Apply BH correction across all flies/replicates ---
+            if raw_pvals:
+                from statsmodels.stats.multitest import multipletests
+                _, bh_qvals, _, _ = multipletests(raw_pvals, method='fdr_bh')
+                df_out["BH.Q"] = np.round(bh_qvals, 6)
+                
+                for i, q in enumerate(np.round(bh_qvals, 6)):
+                    self.result_table[i]["BH.Q"] = q
+            
+            # Store the latest full results (one row per fly/replicate) ---
+            self.latest_result_df = df_out.copy()
+            
+            # --- Display results ---
+            self.status.setText(df_out.to_string(index=False, col_space=20))
+            
+            progress.setValue(n_flies)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Analysis Error", str(e))
+
+
+
+    def run_LME_analysis(self):
+        if not hasattr(self, 'latest_result_df') or self.latest_result_df is None or self.latest_result_df.empty:
+            QMessageBox.warning(self, "No Results", "No analysis results available. Run an analysis first.")
+            return
+
+        df = self.latest_result_df.copy()
+
+        if 'Fly_ID' not in df.columns or df['Fly_ID'].nunique() <= 1:
+            QMessageBox.critical(self, "LME Error", 
+                                 "LME analysis requires individual replicate data with unique Fly_IDs (random effect)."
+                                 "The current results table seems to contain only group means.")
+            return
+        
+        if 'Group' not in df.columns:
+             QMessageBox.critical(self, "LME Error", "The 'Group' column is missing from the results table.")
+             return
+
+        # If multiple methods are present, ask user which one to analyze
+        if "Method" in df.columns and df["Method"].nunique() > 1:
+            methods = df["Method"].unique().tolist()
+            method, ok = QInputDialog.getItem(self, "Analyze wihch result",
+                                              "Select result source", methods, 0, False)
+            if not ok:
+                return
+            df = df[df["Method"] == method].reset_index(drop=True)
+
+        # Identify dependent variable candidates 
+        dependent_candidates = [c for c in df.columns if any(
+            c.startswith(prefix) for prefix in ["AMP", "PER", "Acrophase"])]
+        
+        # Let user choose dependent and random effects
+        dependent, ok = QInputDialog.getItem(
+            self, "Choose Dependent Variable", "Dependent variable:",
+            dependent_candidates, 0, False)
+        if not ok:
+            return
+
+        random_effect = "Fly_ID"
+        fixed_effects = ['Group']
+
+        # Show result
+        try:
+            results_df = LME_model(df, dependent=dependent,
+                              fixed_effects=fixed_effects,
+                              random_effect=random_effect)
+            self.result_table = []
+            for index, row in results_df.iterrows():
+                result_entry = {
+                'Test': 'LME',
+                'Dependent_Var': dependent,
+                'Term': row['Term'],
+                'Estimate': row['Estimate'],
+                'StdErr': row['StdErr'],
+                'z-value': row['z-value'],
+                'p-value': row['p-value']
+                }
+                self.result_table.append(result_entry)
+
+            self.status.setText(results_df.to_string(index=False, col_space=20))
+
+        except Exception as e:
+            QMessageBox.critical(self, "LME Error", str(e))
 
 
 
@@ -1443,7 +2148,7 @@ class CircadianApp(QtWidgets.QMainWindow):
                 return
             groups_to_plot = [selected]
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(8, 6))
         for group in groups_to_plot:
             if group not in data or group not in fits:
                 continue
@@ -1453,6 +2158,12 @@ class CircadianApp(QtWidgets.QMainWindow):
                 series = series.loc[(series.index >= time_range[0]) & (series.index <= time_range[1])]
             times = series.index.to_numpy()
             values = series.values
+
+            # Retrieve SEM data if available
+            sem_data = None
+            if hasattr(self, "group_sems") and dtype in self.group_sems:
+                sem_data = self.group_sems[dtype].get(group, None)
+
 
             fit = fits[group]
             period = fit['period']
@@ -1466,11 +2177,22 @@ class CircadianApp(QtWidgets.QMainWindow):
 
             #color = self.group_colors.get(group, None)
             ax.plot(time_eval, fit_curve, label="Cosinor Fit", color='black')
-            ax.scatter(times, values, label="Mean of Data", color='gray', marker='o', alpha=0.5)
+            ax.scatter(times, values, label="Mean of Data", color='gray', marker='o', alpha=0.6)
 
-        ax.set_xlabel("Time (hr)",fontsize=14)
-        ax.set_ylabel("Value",fontsize=14)
-        ax.set_title(f"{dtype}:{group}",fontsize=14)
+            # Add SEM shading if available
+            if sem_data is not None:
+                sem_vals = sem_data.loc[times] if hasattr(sem_data, "loc") else sem_data
+                plt.fill_between(
+                    times,
+                    values - sem_vals,
+                    values + sem_vals,
+                    alpha=0.3,
+                    label="SEM"
+                )
+
+        ax.set_xlabel("Time (hr)",fontsize=18)
+        ax.set_ylabel("Value",fontsize=18)
+        ax.set_title(f"{dtype}:{group}",fontsize=18)
 
         # set the legend always upper right.
         all_y = np.concatenate([values, fit_curve])
@@ -1478,7 +2200,7 @@ class CircadianApp(QtWidgets.QMainWindow):
         yrange = ymax - ymin
         padding = 0.20 * yrange  # 20% headroom
         ax.set_ylim(ymin, ymax + padding)
-        ax.legend(loc="upper right",fontsize=14)
+        ax.legend(loc="upper right",fontsize=18)
 
         ax.grid(False)
         plt.tight_layout()
@@ -1514,7 +2236,7 @@ class CircadianApp(QtWidgets.QMainWindow):
             groups_to_plot = [selected]
 
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(8, 6))
         for group in groups_to_plot:
             if group not in data or group not in fits:
                 continue
@@ -1525,24 +2247,48 @@ class CircadianApp(QtWidgets.QMainWindow):
             times = series.index.to_numpy()
             values = series.values
 
+            # Retrieve SEM data if available
+            sem_data = None
+            if hasattr(self, "group_sems") and dtype in self.group_sems:
+                sem_data = self.group_sems[dtype].get(group, None)
+
+
             fit = fits[group]
             period = fit['PER']
             lag = fit['LAG']
             amp = fit['AMP']
             mesor = np.mean(values)
 
-            # Cosine model using lag in hours
+            # === Project cosine template onto data (OLS-style scaling) ===
+            # Build cosine template at data timepoints
+            r_data = 2 * np.pi * (times - lag) / period
+            cos_template = np.cos(r_data)
+            # Estimate mesor and amplitude by linear projection
+            X = np.column_stack([np.ones(len(times)), cos_template])
+            beta, _, _, _ = np.linalg.lstsq(X, values, rcond=None)
+            mesor, amp = beta
+            
             time_eval = np.linspace(times.min(), times.max(), 300)
-            phase_rad = 2 * np.pi * (lag / period)
-            radians = (2 * np.pi * time_eval / period) + phase_rad
+            radians = 2 * np.pi * (time_eval - lag) / period
             fit_curve = mesor + amp * np.cos(radians)
 
             ax.plot(time_eval, fit_curve, label="Cosine-Kendall Fit", color='black')
-            ax.scatter(times, values, label="Mean of Data", color='gray', marker='o', alpha=0.5)
+            ax.scatter(times, values, label="Mean of Data", color='gray', marker='o', alpha=0.6)
 
-        ax.set_xlabel("Time (hr)",fontsize=14)
-        ax.set_ylabel("Value",fontsize=14)
-        ax.set_title(f"{dtype}:{group}",fontsize=14)
+            # Add SEM shading if available
+            if sem_data is not None:
+                sem_vals = sem_data.loc[times] if hasattr(sem_data, "loc") else sem_data
+                plt.fill_between(
+                    times,
+                    values - sem_vals,
+                    values + sem_vals,
+                    alpha=0.3,
+                    label="SEM"
+                )
+
+        ax.set_xlabel("Time (hr)",fontsize=18)
+        ax.set_ylabel("Value",fontsize=18)
+        ax.set_title(f"{dtype}:{group}",fontsize=18)
 
         # set the legend always upper right.
         all_y = np.concatenate([values, fit_curve])
@@ -1550,7 +2296,7 @@ class CircadianApp(QtWidgets.QMainWindow):
         yrange = ymax - ymin
         padding = 0.20 * yrange  # 20% headroom
         ax.set_ylim(ymin, ymax + padding)
-        ax.legend(loc="upper right",fontsize=14)
+        ax.legend(loc="upper right",fontsize=18)
 
         ax.grid(False)
         plt.tight_layout()
@@ -1584,7 +2330,7 @@ class CircadianApp(QtWidgets.QMainWindow):
         # === Plot ===
 
         #plt.figure(figsize=(8, 4 * len(groups_to_plot)))
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(8, 6))
         for i, group in enumerate(groups_to_plot):
             if group not in fits:
                 continue
@@ -1594,24 +2340,41 @@ class CircadianApp(QtWidgets.QMainWindow):
             fit_curve = fit_data.get("Fit")
             raw_data = fit_data.get("Raw")
 
+            # Retrieve SEM data if available
+            sem_data = None
+            if hasattr(self, "group_sems") and dtype in self.group_sems:
+                sem_data = self.group_sems[dtype].get(group, None)
+
             if time is None or fit_curve is None or raw_data is None:
                 continue
 
             plt.subplot(len(groups_to_plot), 1, i + 1)
             plt.plot(time, fit_curve, '-', label="Python-JTK Fit", color="black")
-            plt.plot(time, raw_data, 'o', label="Mean of Data", alpha=0.5, color='gray')
-            
-            plt.title(f"{dtype}:{group}",fontsize=14)
-            plt.xlabel("Time (hr)",fontsize=14)
-            plt.ylabel("Value",fontsize=14)
-            
+            plt.plot(time, raw_data, 'o', label="Mean of Data", alpha=0.6, color='gray')
+
+            # Add SEM shading if available
+            if sem_data is not None:
+                sem_vals = sem_data.loc[time] if hasattr(sem_data, "loc") else sem_data
+                plt.fill_between(
+                    time,
+                    raw_data - sem_vals,
+                    raw_data + sem_vals,
+                    alpha=0.3,
+                    label="SEM"
+                )
+
+            plt.title(f"{dtype}:{group}",fontsize=18)
+            plt.xlabel("Time (hr)",fontsize=18) 
+            plt.ylabel("Value",fontsize=18)  
+
+
                     # set the legend always upper right.
             all_y = np.concatenate([raw_data, fit_curve])
             ymin, ymax = np.min(all_y), np.max(all_y)
             yrange = ymax - ymin
             padding = 0.20 * yrange  # 20% headroom
             plt.ylim(ymin, ymax + padding)
-            plt.legend(loc="upper right",fontsize=14)
+            plt.legend(loc="upper right",fontsize=18)
             
             plt.grid(False)
 
@@ -1644,7 +2407,7 @@ class CircadianApp(QtWidgets.QMainWindow):
                 return
             groups_to_plot = [selected]
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(8, 6))
 
         for group in groups_to_plot:
             if group not in data or group not in fits:
@@ -1657,6 +2420,12 @@ class CircadianApp(QtWidgets.QMainWindow):
             values = series.values
             mesor = np.mean(values)
 
+            # Retrieve SEM data if available
+            sem_data = None
+            if hasattr(self, "group_sems") and dtype in self.group_sems:
+                sem_data = self.group_sems[dtype].get(group, None)
+
+
             fit = fits[group]  # should contain t_grid and model_wave
             t_grid_full = fit.get('t_grid_full')
             model_wave_full = mesor + fit.get('model_wave_full')
@@ -1665,11 +2434,22 @@ class CircadianApp(QtWidgets.QMainWindow):
 
 
             ax.plot(t_grid_full, model_wave_full, label="Harmonic-Cosinor Fit", color='black', lw=2)
-            ax.scatter(times, values, label="Mean of Data", color='gray', alpha=0.5)
+            ax.scatter(times, values, label="Mean of Data", color='gray', alpha=0.6)
 
-        ax.set_xlabel("Time (hr)",fontsize=14)
-        ax.set_ylabel("Value",fontsize=14)
-        ax.set_title(f"{dtype}:{group}",fontsize=14)
+            # Add SEM shading if available
+            if sem_data is not None:
+                sem_vals = sem_data.loc[times] if hasattr(sem_data, "loc") else sem_data
+                plt.fill_between(
+                    times,
+                    values - sem_vals,
+                    values + sem_vals,
+                    alpha=0.3,
+                    label="SEM"
+                )
+
+        ax.set_xlabel("Time (hr)",fontsize=18)
+        ax.set_ylabel("Value",fontsize=18)
+        ax.set_title(f"{dtype}:{group}",fontsize=18)
         
         # set the legend always upper right.
         all_y = np.concatenate([values, model_wave_full])
@@ -1677,12 +2457,149 @@ class CircadianApp(QtWidgets.QMainWindow):
         yrange = ymax - ymin
         padding = 0.20 * yrange  # 20% headroom
         ax.set_ylim(ymin, ymax + padding)
-        ax.legend(loc="upper right",fontsize=14)
+        ax.legend(loc="upper right",fontsize=18)
         
         ax.grid(False)
         plt.tight_layout()
         plt.show()
         
+
+    def plot_cwt(self, dtype=None, groups_to_plot=None, time_range=None):
+        if dtype is None:
+            dtype = getattr(self, "last_analyzed_dtype", None)
+        if time_range is None:
+            time_range = getattr(self, "last_analyzed_timerange", None)
+
+        if not hasattr(self, 'group_means') or dtype not in self.group_means:
+            QMessageBox.warning(self, "Missing Data", "Run CWT analysis first.")
+            return
+
+        data = self.group_means[dtype]
+
+        if not groups_to_plot:
+            group_list = list(data.keys())
+            selected, ok = QInputDialog.getItem(
+                self, "Select Group", "Which group to plot?", group_list, 0, False)
+            if not ok:
+                return
+            groups_to_plot = [selected]
+        
+        for group in groups_to_plot:
+            if group not in data:
+                continue
+
+            series = data[group]
+            if time_range:
+                series = series.loc[(series.index >= time_range[0]) & (series.index <= time_range[1])]
+
+            times = series.index.to_numpy()
+            values = series.values
+
+            if len(times) < 2:
+                continue
+
+            interval = np.diff(times).mean()
+
+            # Detrend
+            y = values - np.mean(values)
+
+            # Period range
+            period_range = np.arange(20, 28.1, 0.1)
+            scales = period_range / interval
+
+            coef, freqs = pywt.cwt(y, scales, 'cmor1.5-1.0', sampling_period=interval)
+            raw_power = np.abs(coef) ** 2
+
+            # Visualization copy (normalized ONLY for heatmap display)
+            if np.max(raw_power) > 0:
+                power = raw_power / np.max(raw_power)
+            else:
+                power = raw_power
+
+
+            # Dominant period ridge
+            dom_periods = period_range[np.argmax(raw_power, axis=0)]
+
+            # ---- Plot ----
+            fig = plt.figure(figsize=(8, 8))
+            gs = fig.add_gridspec(
+                2, 2,
+                height_ratios=[3, 1],
+                width_ratios=[20, 1],
+                hspace=0.25,
+                wspace=0.05
+            )
+            ax = fig.add_subplot(gs[0, 0])
+            ax2 = fig.add_subplot(gs[1, 0], sharex=ax)
+            cax = fig.add_subplot(gs[0, 1])
+            empty_ax = fig.add_subplot(gs[1, 1])
+            empty_ax.axis("off")
+
+            im = ax.imshow(
+                power,
+                extent=[times.min(), times.max(), period_range.min(), period_range.max()],
+                aspect='auto',
+                origin='lower',
+                interpolation='nearest'
+            )
+            
+            
+            # Colorbar only for the top panel; right column keeps widths aligned
+            cbar = fig.colorbar(im, cax=cax)
+            cbar.set_label("Power", fontsize=18)
+            
+            # Ensure x-axis alignment between panels
+            xmin, xmax = times.min(), times.max()
+            ax.set_xlim(xmin, xmax)
+            ax2.set_xlim(xmin, xmax)
+
+
+            # Add contour lines for clearer structure
+            ax.contour(
+                times,
+                period_range,
+                power,
+                levels=5,
+                colors='black',
+                linewidths=0.5
+            )
+
+            # Overlay ridge
+            ax.plot(times, dom_periods, color='white', lw=2, label='Dominant Period')
+
+
+            # ---- Ridge amplitude (dominant rhythm strength) ----
+            ridge_indices = np.argmax(raw_power, axis=0)
+            ridge_power = raw_power[ridge_indices, np.arange(raw_power.shape[1])]
+
+            ax2.plot(times, ridge_power, lw=2)
+            ax2.set_ylabel("Oscillation Strength", fontsize=18)
+
+
+            #ax2.set_title("Dominant Rhythm Amplitude (Ridge Power)", fontsize=18)
+            ax2.grid(False)
+ 
+            ax.set_ylabel("Period (hr)", fontsize=18)
+            ax.set_title(f"{dtype}: {group} (CWT Scalogram)", fontsize=18)
+            ax2.set_xlabel("Time (hr)", fontsize=18) # keep this
+
+
+            # Add mean dominant period annotation
+            mean_per = np.mean(dom_periods)
+            ax.text(
+                0.02, 0.85,
+                f"Mean PER = {mean_per:.2f} hr",
+                transform=ax.transAxes,
+                fontsize=18,
+                color='white',
+                verticalalignment='top'
+            )
+
+            ax.legend(loc="upper right", fontsize=18)
+            ax.grid(False)
+            plt.tight_layout()
+            plt.show()
+
 
 
     def export_plot(self):
