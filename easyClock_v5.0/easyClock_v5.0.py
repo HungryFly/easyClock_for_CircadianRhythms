@@ -791,7 +791,7 @@ class CircadianApp(QtWidgets.QMainWindow):
         QMessageBox.about(
             self,
             "About easyClock",
-            "🕓 easyClock v3.6\n\n"
+            "🕓 easyClock v5.0\n\n"
             "Developed by: Binbin Wu Ph.D.\n"
             "Ja Lab, UF Scripps Institute, University of Florida\n"
             "© 2026. All rights reserved.\n\n"
